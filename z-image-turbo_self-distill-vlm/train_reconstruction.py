@@ -389,6 +389,7 @@ def main():
     )
     pipeline.transformer = get_peft_model(pipeline.transformer, lora_config, adapter_name="recon")
     pipeline.transformer.set_adapter("recon")
+    pipeline.transformer.to(accelerator.device, dtype=inference_dtype)
     if args.enable_gc:
         pipeline.transformer.enable_gradient_checkpointing()
 
