@@ -44,7 +44,7 @@ cd "${REPO_DIR}"
   --enable-gc \
   --log-steps 1 \
   --sample-steps 100 \
-  --checkpoint-steps 500 \
+  --checkpoint-steps 100 \
   --sample-num-images 4 \
   --sample-inference-steps 28 \
   --sample-guidance-scale 4.0

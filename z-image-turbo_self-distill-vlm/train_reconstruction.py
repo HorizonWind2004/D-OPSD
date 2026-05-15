@@ -278,8 +278,18 @@ def sample_reconstructions(args, pipeline, vl_model, processor, batch, save_dir:
         use_system_prompt=False,
     )
     generators = [torch.Generator(accelerator.device).manual_seed(args.seed + step * 1000 + i) for i in range(len(images))]
+    negative_prompt_embeds = None
+    if args.sample_guidance_scale > 0:
+        negative_prompt_embeds = _encode_prompt(
+            pipeline.text_encoder,
+            pipeline.tokenizer,
+            ["" for _ in prompt_embeds],
+            device=accelerator.device,
+            max_sequence_length=args.max_sequence_length,
+        )
     recon = pipeline(
         prompt_embeds=prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
         height=args.resolution,
         width=args.resolution,
         num_inference_steps=args.sample_inference_steps,
