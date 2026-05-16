@@ -14,7 +14,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import ZImagePipeline
 from diffusers.utils.torch_utils import is_compiled_module
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import functional as TF
@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=64)
     parser.add_argument("--lora-alpha", type=int, default=128)
+    parser.add_argument("--resume-lora", default=None)
+    parser.add_argument("--initial-global-step", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
 
     parser.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="bf16")
@@ -95,6 +97,16 @@ def parse_args():
 def unwrap_model(model, accelerator):
     model = accelerator.unwrap_model(model)
     return model._orig_mod if is_compiled_module(model) else model
+
+
+def resolve_lora_path(path: str) -> str:
+    candidate = Path(path)
+    if (candidate / "adapter_config.json").is_file():
+        return str(candidate)
+    nested = candidate / "recon"
+    if (nested / "adapter_config.json").is_file():
+        return str(nested)
+    raise FileNotFoundError(f"LoRA adapter_config.json not found under {path}")
 
 
 def make_logger(save_dir: Path):
@@ -391,13 +403,25 @@ def main():
         "attention.to_v",
         "attention.to_out.0",
     ]
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        init_lora_weights="gaussian",
-        target_modules=target_modules,
-    )
-    pipeline.transformer = get_peft_model(pipeline.transformer, lora_config, adapter_name="recon")
+    if args.resume_lora:
+        resume_lora = resolve_lora_path(args.resume_lora)
+        if accelerator.is_main_process:
+            logger.info(f"Resuming LoRA from: {resume_lora}")
+        pipeline.transformer = PeftModel.from_pretrained(
+            pipeline.transformer,
+            resume_lora,
+            adapter_name="recon",
+            is_trainable=True,
+            torch_dtype=inference_dtype,
+        )
+    else:
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            init_lora_weights="gaussian",
+            target_modules=target_modules,
+        )
+        pipeline.transformer = get_peft_model(pipeline.transformer, lora_config, adapter_name="recon")
     pipeline.transformer.set_adapter("recon")
     pipeline.transformer.to(accelerator.device, dtype=inference_dtype)
     if args.enable_gc:
@@ -445,10 +469,17 @@ def main():
         logger.info(f"Learning rate: {args.learning_rate}")
         logger.info(f"Trainable params: {sum(p.numel() for p in trainable_params)}")
 
-    global_step = 0
-    progress = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process, desc="steps")
+    global_step = args.initial_global_step
+    target_step = args.initial_global_step + args.max_train_steps
+    progress = tqdm(
+        range(args.initial_global_step, target_step),
+        initial=args.initial_global_step,
+        total=target_step,
+        disable=not accelerator.is_local_main_process,
+        desc="steps",
+    )
     last_batch = None
-    while global_step < args.max_train_steps:
+    while global_step < target_step:
         for batch in dataloader:
             with accelerator.accumulate(pipeline.transformer):
                 images = batch["pixel_values"].to(device=accelerator.device, dtype=vae_dtype)
@@ -495,7 +526,7 @@ def main():
                 if accelerator.is_main_process and global_step % args.log_steps == 0:
                     print(f"step={global_step} loss={gathered_loss:.6f}", flush=True)
 
-                if global_step % args.checkpoint_steps == 0 or global_step == args.max_train_steps:
+                if global_step % args.checkpoint_steps == 0 or global_step == target_step:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         ckpt = checkpoint_dir / f"step_{global_step:06d}" / "recon"
@@ -507,7 +538,7 @@ def main():
                     sample_reconstructions(args, pipeline, vl_model, processor, last_batch, save_dir, global_step, accelerator, inference_dtype)
                     sample_t2i(args, pipeline, save_dir, global_step, accelerator)
 
-                if global_step >= args.max_train_steps:
+                if global_step >= target_step:
                     break
 
     accelerator.wait_for_everyone()
