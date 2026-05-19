@@ -55,7 +55,9 @@ def parse_args():
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.999)
     parser.add_argument("--adam-epsilon", type=float, default=1e-8)
+    parser.add_argument("--use-8bit-adam", action="store_true")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--train-mode", choices=["lora", "full"], default="lora")
     parser.add_argument("--lora-rank", type=int, default=64)
     parser.add_argument("--lora-alpha", type=int, default=128)
     parser.add_argument("--resume-lora", default=None)
@@ -69,6 +71,8 @@ def parse_args():
     parser.add_argument("--log-steps", type=int, default=1)
     parser.add_argument("--sample-steps", type=int, default=100)
     parser.add_argument("--checkpoint-steps", type=int, default=500)
+    parser.add_argument("--disable-checkpointing", action="store_true")
+    parser.add_argument("--disable-final-save", action="store_true")
     parser.add_argument("--sample-num-images", type=int, default=4)
     parser.add_argument("--sample-inference-steps", type=int, default=28)
     parser.add_argument("--sample-guidance-scale", type=float, default=4.0)
@@ -394,16 +398,14 @@ def main():
     vl_model.to(accelerator.device, dtype=inference_dtype)
     vl_model.eval()
 
-    target_modules = [
-        "feed_forward.w1",
-        "feed_forward.w2",
-        "feed_forward.w3",
-        "attention.to_k",
-        "attention.to_q",
-        "attention.to_v",
-        "attention.to_out.0",
-    ]
-    if args.resume_lora:
+    if args.train_mode == "full" and args.resume_lora:
+        raise ValueError("--resume-lora is only supported with --train-mode lora")
+
+    if args.train_mode == "full":
+        if accelerator.is_main_process:
+            logger.info("Training full Z-Image transformer parameters")
+        pipeline.transformer.requires_grad_(True)
+    elif args.resume_lora:
         resume_lora = resolve_lora_path(args.resume_lora)
         if accelerator.is_main_process:
             logger.info(f"Resuming LoRA from: {resume_lora}")
@@ -415,6 +417,15 @@ def main():
             torch_dtype=inference_dtype,
         )
     else:
+        target_modules = [
+            "feed_forward.w1",
+            "feed_forward.w2",
+            "feed_forward.w3",
+            "attention.to_k",
+            "attention.to_q",
+            "attention.to_v",
+            "attention.to_out.0",
+        ]
         lora_config = LoraConfig(
             r=args.lora_rank,
             lora_alpha=args.lora_alpha,
@@ -422,7 +433,8 @@ def main():
             target_modules=target_modules,
         )
         pipeline.transformer = get_peft_model(pipeline.transformer, lora_config, adapter_name="recon")
-    pipeline.transformer.set_adapter("recon")
+    if args.train_mode == "lora":
+        pipeline.transformer.set_adapter("recon")
     pipeline.transformer.to(accelerator.device, dtype=inference_dtype)
     if args.enable_gc:
         pipeline.transformer.enable_gradient_checkpointing()
@@ -452,7 +464,16 @@ def main():
     )
 
     trainable_params = [p for p in pipeline.transformer.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
+    if args.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError as exc:
+            raise ImportError("Install bitsandbytes to use --use-8bit-adam") from exc
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
+
+    optimizer = optimizer_cls(
         trainable_params,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
@@ -526,7 +547,7 @@ def main():
                 if accelerator.is_main_process and global_step % args.log_steps == 0:
                     print(f"step={global_step} loss={gathered_loss:.6f}", flush=True)
 
-                if global_step % args.checkpoint_steps == 0 or global_step == target_step:
+                if not args.disable_checkpointing and (global_step % args.checkpoint_steps == 0 or global_step == target_step):
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
                         ckpt = checkpoint_dir / f"step_{global_step:06d}" / "recon"
@@ -542,7 +563,7 @@ def main():
                     break
 
     accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and not args.disable_final_save:
         final_dir = checkpoint_dir / "final" / "recon"
         final_dir.parent.mkdir(parents=True, exist_ok=True)
         unwrap_model(pipeline.transformer, accelerator).save_pretrained(final_dir)
