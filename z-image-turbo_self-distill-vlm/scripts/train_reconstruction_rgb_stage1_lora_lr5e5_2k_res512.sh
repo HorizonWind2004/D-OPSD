@@ -11,7 +11,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACCELERATE_BIN="${ACCELERATE_BIN:-/opt/tiger/RGB/.venv/bin/accelerate}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 
 cd "${REPO_DIR}"
 
